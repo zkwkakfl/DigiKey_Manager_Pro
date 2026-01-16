@@ -8,7 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import os
 from excel_handler import ExcelHandler
-from digikey_api import DigikeyAPIClient
+from digikey_api import DigikeyAPIClient, RateLimitExceeded
 
 
 class DigikeyViewerApp:
@@ -600,14 +600,50 @@ class DigikeyViewerApp:
                             'MountingType': result.get('MountingType', 'N/A'),
                             'FullData': result
                         })
+                except RateLimitExceeded as e:
+                    # API 호출 한도 초과 시 조회 중단
+                    progress_window.destroy()
+                    
+                    # 재시도 시간 정보 포함 메시지
+                    retry_info = ""
+                    if e.retry_after:
+                        hours = e.retry_after // 3600
+                        minutes = (e.retry_after % 3600) // 60
+                        if hours > 0:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {hours}시간 {minutes}분 후"
+                        elif minutes > 0:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {minutes}분 후"
+                        else:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {e.retry_after}초 후"
+                    
+                    messagebox.showwarning(
+                        "API 호출 한도 초과",
+                        f"API 일일 호출 제한에 도달했습니다.\n\n"
+                        f"조회가 중단되었습니다.\n"
+                        f"현재까지 조회된 결과: {len(query_results)}개\n\n"
+                        f"상세 정보:\n{str(e)}{retry_info}\n\n"
+                        f"※ Product Information API 제한:\n"
+                        f"  - 일일 최대: 1,000회\n"
+                        f"  - 분당 최대: 120회"
+                    )
+                    
+                    # 현재까지 조회된 결과 표시
+                    if query_results:
+                        self.query_results = query_results
+                        self.display_query_results()
+                        self.notebook.select(1)
+                    
+                    return  # 조회 중단
                 except Exception as e:
-                    # API 오류 시에도 기본 정보는 추가
+                    # API 오류 시에도 기본 정보는 추가 (오류 메시지 포함)
+                    error_msg = str(e)
+                    print(f"파트넘버 조회 오류 ({part_number}): {error_msg}")  # 콘솔에 오류 출력
                     query_results.append({
                         'Row': idx,
                         'PartNumber': part_number,
                         'Manufacturer': '조회 실패',
                         'MountingType': '조회 실패',
-                        'FullData': {'error': str(e)}
+                        'FullData': {'error': error_msg}
                     })
             
             self.query_results = query_results

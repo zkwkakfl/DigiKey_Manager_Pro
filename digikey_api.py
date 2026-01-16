@@ -10,6 +10,13 @@ import time
 from typing import Dict, Optional
 
 
+class RateLimitExceeded(Exception):
+    """API 호출 한도 초과 예외"""
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class DigikeyAPIClient:
     """디지키 API 클라이언트 클래스"""
     
@@ -302,11 +309,33 @@ class DigikeyAPIClient:
             # 응답 상태 확인
             if response.status_code != 200:
                 error_msg = f"API 호출 실패 (상태 코드: {response.status_code})"
-                try:
-                    error_data = response.json()
-                    error_msg += f"\n오류: {error_data}"
-                except:
-                    error_msg += f"\n응답: {response.text[:200]}"
+                
+                # 429 오류 (일일 호출 제한 초과) 특별 처리
+                if response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After', '알 수 없음')
+                    try:
+                        error_data = response.json()
+                        detail = error_data.get('detail', '')
+                        error_msg = f"API 일일 호출 제한 초과 (429 Too Many Requests)\n"
+                        error_msg += f"상세: {detail}\n"
+                        error_msg += f"재시도 가능 시간: {retry_after}초 후"
+                    except:
+                        error_msg += f"\n응답: {response.text[:200]}"
+                        error_msg += f"\n재시도 가능 시간: {retry_after}초 후"
+                    
+                    # RateLimitExceeded 예외 발생 (조회 중단을 위해)
+                    try:
+                        retry_after_int = int(retry_after) if retry_after != '알 수 없음' else None
+                    except:
+                        retry_after_int = None
+                    raise RateLimitExceeded(error_msg, retry_after_int)
+                else:
+                    try:
+                        error_data = response.json()
+                        error_msg += f"\n오류: {error_data}"
+                    except:
+                        error_msg += f"\n응답: {response.text[:200]}"
+                
                 raise Exception(error_msg)
             
             response.raise_for_status()

@@ -1,7 +1,7 @@
 """
 디지키 API를 사용한 파트넘버 조회 애플리케이션
 엑셀 파일에서 시트를 선택하고, 파트넘버를 더블클릭하여 조회하는 GUI 프로그램
-버전 1.2.3 - 조회 실패 파트넘버 DB 캐싱 기능 추가
+버전 1.2.4 - 조회 진행 상황 표시 및 조회 실패 파트넘버 웹 검색 링크 추가
 """
 
 import tkinter as tk
@@ -19,7 +19,7 @@ class DigikeyViewerApp:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.3")
+        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.4")
         self.root.geometry("1200x700")
         
         # API 일일 호출 제한 (디지키 Product Information API)
@@ -590,16 +590,42 @@ class DigikeyViewerApp:
         db_hits = 0  # DB에서 조회한 횟수
         api_calls = 0  # API 호출 횟수
         
+        # v1.2.4: 전체 조회할 파트넘버 개수 계산 (빈 값 제외)
+        total_parts = 0
+        for idx in range(start_row, len(self.current_df)):
+            part_number = str(self.current_df.iloc[idx][part_number_col]).strip()
+            if part_number and part_number != 'nan':
+                total_parts += 1
+        
         # 진행 상황 표시
         progress_window = tk.Toplevel(self.root)
         progress_window.title("조회 중...")
-        progress_window.geometry("400x120")
-        progress_label = ttk.Label(progress_window, text="파트넘버를 조회하고 있습니다...")
+        progress_window.geometry("450x150")
+        progress_window.resizable(False, False)
+        
+        # 창 중앙 배치
+        progress_window.update_idletasks()
+        x = (progress_window.winfo_screenwidth() // 2) - (progress_window.winfo_width() // 2)
+        y = (progress_window.winfo_screenheight() // 2) - (progress_window.winfo_height() // 2)
+        progress_window.geometry(f"+{x}+{y}")
+        
+        progress_label = ttk.Label(progress_window, text="파트넘버를 조회하고 있습니다...", font=("Arial", 10, "bold"))
         progress_label.pack(pady=10)
-        progress_detail = ttk.Label(progress_window, text="")
+        
+        # v1.2.4: 진행 상황 표시 (전체/조회 완료)
+        progress_count_label = ttk.Label(progress_window, text=f"조회 진행: 0 / {total_parts}개", font=("Arial", 9))
+        progress_count_label.pack(pady=2)
+        
+        progress_detail = ttk.Label(progress_window, text="", font=("Arial", 8))
         progress_detail.pack(pady=5)
         
+        # 진행률 바 추가
+        progress_bar = ttk.Progressbar(progress_window, length=400, mode='determinate', maximum=total_parts)
+        progress_bar.pack(pady=5)
+        
         self.root.update()
+        
+        queried_count = 0  # 조회 완료한 개수
         
         try:
             # 선택한 행부터 끝까지 순환
@@ -610,8 +636,12 @@ class DigikeyViewerApp:
                 if not part_number or part_number == 'nan':
                     continue
                 
-                # 진행 상황 업데이트
+                queried_count += 1
+                
+                # v1.2.4: 진행 상황 업데이트 (전체/조회 완료 개수 표시)
+                progress_count_label.config(text=f"조회 진행: {queried_count} / {total_parts}개")
                 progress_detail.config(text=f"조회 중: {part_number} (Row {idx})\nDB: {db_hits}건 | API: {api_calls}건")
+                progress_bar['value'] = queried_count
                 self.root.update()
                 
                 result = None
@@ -856,7 +886,30 @@ class DigikeyViewerApp:
                     else:
                         self.detail_text.insert(tk.END, f"{key}: {value}\n")
         else:
-            self.detail_text.insert(tk.END, f"\n오류: {full_data.get('error', '알 수 없는 오류')}\n")
+            # v1.2.4: 조회 실패한 파트넘버에 웹 검색 링크 추가
+            error_msg = full_data.get('error', '알 수 없는 오류')
+            self.detail_text.insert(tk.END, f"\n오류: {error_msg}\n\n")
+            
+            # 디지키 웹 검색 링크 추가
+            part_number = result_data.get('PartNumber', '')
+            if part_number:
+                self.detail_text.insert(tk.END, "--- 웹 검색 ---\n")
+                self.detail_text.insert(tk.END, "디지키 웹사이트에서 검색: ")
+                
+                # 디지키 검색 URL 생성
+                search_url = f"https://www.digikey.com/en/products?keywords={part_number}"
+                url_start = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, search_url)
+                url_end = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, "\n")
+                
+                # 링크 태그 생성 및 적용
+                tag_name = f"search_url_{id(search_url)}"
+                self.detail_text.tag_add(tag_name, url_start, url_end)
+                self.detail_text.tag_config(tag_name, foreground="blue", underline=True)
+                self.detail_text.tag_bind(tag_name, "<Button-1>", lambda e, url=search_url: self.open_url(url))
+                self.detail_text.tag_bind(tag_name, "<Enter>", lambda e: self.detail_text.config(cursor="hand2"))
+                self.detail_text.tag_bind(tag_name, "<Leave>", lambda e: self.detail_text.config(cursor=""))
         
         # 텍스트 위젯을 다시 읽기 전용으로 변경
         self.detail_text.config(state=tk.DISABLED)

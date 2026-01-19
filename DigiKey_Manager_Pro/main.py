@@ -1,14 +1,17 @@
 """
 디지키 API를 사용한 파트넘버 조회 애플리케이션
 엑셀 파일에서 시트를 선택하고, 파트넘버를 더블클릭하여 조회하는 GUI 프로그램
+버전 1.2.3 - 조회 실패 파트넘버 DB 캐싱 기능 추가
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import os
+import webbrowser
 from excel_handler import ExcelHandler
 from digikey_api import DigikeyAPIClient, RateLimitExceeded
+from database import PartDatabase
 
 
 class DigikeyViewerApp:
@@ -16,12 +19,16 @@ class DigikeyViewerApp:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("디지키 파트넘버 조회 프로그램")
+        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.3")
         self.root.geometry("1200x700")
+        
+        # API 일일 호출 제한 (디지키 Product Information API)
+        self.api_daily_limit = 1000
         
         # 데이터 저장 변수
         self.excel_handler = ExcelHandler()
         self.digikey_api = DigikeyAPIClient()
+        self.part_db = PartDatabase()  # 파트넘버 데이터베이스
         self.current_df = None  # 현재 로드된 엑셀 데이터
         self.query_results = []  # 조회 결과 저장
         self.config_file = "config.txt"  # 설정 파일 경로
@@ -61,6 +68,11 @@ class DigikeyViewerApp:
         menubar.add_cascade(label="설정", menu=settings_menu)
         settings_menu.add_command(label="디지키 API 설정", command=self.show_api_settings)
         
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="도구", menu=tools_menu)
+        tools_menu.add_command(label="데이터베이스 통계", command=self.show_db_stats)
+        tools_menu.add_command(label="API 호출 통계", command=self.show_api_stats)
+        
         # 상단 도구바
         toolbar = ttk.Frame(main_frame)
         toolbar.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -71,6 +83,11 @@ class DigikeyViewerApp:
         
         self.sheet_label = ttk.Label(toolbar, text="선택된 시트: 없음")
         self.sheet_label.pack(side=tk.LEFT, padx=10)
+        
+        # API 호출 통계 라벨
+        self.api_stats_label = ttk.Label(toolbar, text="")
+        self.api_stats_label.pack(side=tk.RIGHT, padx=10)
+        self.update_api_stats_label()
         
         # 탭 위젯 생성
         self.notebook = ttk.Notebook(main_frame)
@@ -570,13 +587,17 @@ class DigikeyViewerApp:
             return
         
         query_results = []
+        db_hits = 0  # DB에서 조회한 횟수
+        api_calls = 0  # API 호출 횟수
         
         # 진행 상황 표시
         progress_window = tk.Toplevel(self.root)
         progress_window.title("조회 중...")
-        progress_window.geometry("300x100")
+        progress_window.geometry("400x120")
         progress_label = ttk.Label(progress_window, text="파트넘버를 조회하고 있습니다...")
-        progress_label.pack(pady=20)
+        progress_label.pack(pady=10)
+        progress_detail = ttk.Label(progress_window, text="")
+        progress_detail.pack(pady=5)
         
         self.root.update()
         
@@ -589,61 +610,87 @@ class DigikeyViewerApp:
                 if not part_number or part_number == 'nan':
                     continue
                 
-                # 디지키 API로 조회
-                try:
-                    result = self.digikey_api.search_part(part_number)
-                    if result:
-                        query_results.append({
-                            'Row': idx,
+                # 진행 상황 업데이트
+                progress_detail.config(text=f"조회 중: {part_number} (Row {idx})\nDB: {db_hits}건 | API: {api_calls}건")
+                self.root.update()
+                
+                result = None
+                
+                # 1. 먼저 데이터베이스에서 조회
+                db_result = self.part_db.get_part(part_number)
+                if db_result:
+                    result = db_result
+                    db_hits += 1
+                else:
+                    # 2. DB에 없으면 디지키 API로 조회
+                    try:
+                        api_result = self.digikey_api.search_part(part_number)
+                        if api_result:
+                            api_calls += 1
+                            result = api_result
+                            
+                            # API 호출 횟수 증가 (성공/실패 여부와 관계없이)
+                            self.part_db.increment_api_call()
+                            
+                            # API 조회 결과를 데이터베이스에 저장
+                            # v1.2.3: 조회 실패한 파트넘버도 저장하여 중복 조회 방지
+                            if 'Error' not in api_result:
+                                # 검색 결과 없음, API 오류 등도 모두 저장
+                                self.part_db.save_part(api_result)
+                    except RateLimitExceeded as e:
+                        # API 호출 한도 초과 시 조회 중단
+                        progress_window.destroy()
+                        
+                        # 재시도 시간 정보 포함 메시지
+                        retry_info = ""
+                        if e.retry_after:
+                            hours = e.retry_after // 3600
+                            minutes = (e.retry_after % 3600) // 60
+                            if hours > 0:
+                                retry_info = f"\n\n재시도 가능 시간: 약 {hours}시간 {minutes}분 후"
+                            elif minutes > 0:
+                                retry_info = f"\n\n재시도 가능 시간: 약 {minutes}분 후"
+                            else:
+                                retry_info = f"\n\n재시도 가능 시간: 약 {e.retry_after}초 후"
+                        
+                        messagebox.showwarning(
+                            "API 호출 한도 초과",
+                            f"API 일일 호출 제한에 도달했습니다.\n\n"
+                            f"조회가 중단되었습니다.\n"
+                            f"현재까지 조회된 결과: {len(query_results)}개\n"
+                            f"DB 조회: {db_hits}건 | API 호출: {api_calls}건\n\n"
+                            f"상세 정보:\n{str(e)}{retry_info}\n\n"
+                            f"※ Product Information API 제한:\n"
+                            f"  - 일일 최대: 1,000회\n"
+                            f"  - 분당 최대: 120회"
+                        )
+                        
+                        # 현재까지 조회된 결과 표시
+                        if query_results:
+                            self.query_results = query_results
+                            self.display_query_results()
+                            self.notebook.select(1)
+                        
+                        return  # 조회 중단
+                    except Exception as e:
+                        # API 오류 시에도 기본 정보는 추가 (오류 메시지 포함)
+                        error_msg = str(e)
+                        print(f"파트넘버 조회 오류 ({part_number}): {error_msg}")  # 콘솔에 오류 출력
+                        result = {
                             'PartNumber': part_number,
-                            'Manufacturer': result.get('Manufacturer', 'N/A'),
-                            'MountingType': result.get('MountingType', 'N/A'),
-                            'FullData': result
-                        })
-                except RateLimitExceeded as e:
-                    # API 호출 한도 초과 시 조회 중단
-                    progress_window.destroy()
-                    
-                    # 재시도 시간 정보 포함 메시지
-                    retry_info = ""
-                    if e.retry_after:
-                        hours = e.retry_after // 3600
-                        minutes = (e.retry_after % 3600) // 60
-                        if hours > 0:
-                            retry_info = f"\n\n재시도 가능 시간: 약 {hours}시간 {minutes}분 후"
-                        elif minutes > 0:
-                            retry_info = f"\n\n재시도 가능 시간: 약 {minutes}분 후"
-                        else:
-                            retry_info = f"\n\n재시도 가능 시간: 약 {e.retry_after}초 후"
-                    
-                    messagebox.showwarning(
-                        "API 호출 한도 초과",
-                        f"API 일일 호출 제한에 도달했습니다.\n\n"
-                        f"조회가 중단되었습니다.\n"
-                        f"현재까지 조회된 결과: {len(query_results)}개\n\n"
-                        f"상세 정보:\n{str(e)}{retry_info}\n\n"
-                        f"※ Product Information API 제한:\n"
-                        f"  - 일일 최대: 1,000회\n"
-                        f"  - 분당 최대: 120회"
-                    )
-                    
-                    # 현재까지 조회된 결과 표시
-                    if query_results:
-                        self.query_results = query_results
-                        self.display_query_results()
-                        self.notebook.select(1)
-                    
-                    return  # 조회 중단
-                except Exception as e:
-                    # API 오류 시에도 기본 정보는 추가 (오류 메시지 포함)
-                    error_msg = str(e)
-                    print(f"파트넘버 조회 오류 ({part_number}): {error_msg}")  # 콘솔에 오류 출력
+                            'Manufacturer': '조회 실패',
+                            'MountingType': '조회 실패',
+                            'error': error_msg
+                        }
+                
+                # 결과가 있으면 query_results에 추가
+                if result:
                     query_results.append({
                         'Row': idx,
                         'PartNumber': part_number,
-                        'Manufacturer': '조회 실패',
-                        'MountingType': '조회 실패',
-                        'FullData': {'error': error_msg}
+                        'Manufacturer': result.get('Manufacturer', 'N/A'),
+                        'MountingType': result.get('MountingType', 'N/A'),
+                        'FullData': result
                     })
             
             self.query_results = query_results
@@ -653,7 +700,25 @@ class DigikeyViewerApp:
             self.notebook.select(1)
             
             progress_window.destroy()
-            messagebox.showinfo("완료", f"{len(query_results)}개의 파트넘버 조회가 완료되었습니다.")
+            
+            # API 통계 라벨 업데이트
+            self.update_api_stats_label()
+            
+            # 조회 결과 통계 메시지
+            today_total_calls = self.part_db.get_today_api_calls()
+            remaining_calls = max(0, self.api_daily_limit - today_total_calls)
+            
+            messagebox.showinfo(
+                "조회 완료", 
+                f"{len(query_results)}개의 파트넘버 조회가 완료되었습니다.\n\n"
+                f"조회 통계:\n"
+                f"  - 데이터베이스에서 조회: {db_hits}건\n"
+                f"  - API 호출: {api_calls}건\n\n"
+                f"오늘 API 호출 현황:\n"
+                f"  - 총 호출: {today_total_calls}/{self.api_daily_limit}회\n"
+                f"  - 남은 호출: {remaining_calls}회\n\n"
+                f"※ API 호출 횟수가 절약되었습니다!"
+            )
             
         except Exception as e:
             progress_window.destroy()
@@ -715,35 +780,93 @@ class DigikeyViewerApp:
         self.detail_text.config(state=tk.NORMAL)
         self.detail_text.delete(1.0, tk.END)
         
+        # 기존 태그 삭제
+        for tag in self.detail_text.tag_names():
+            self.detail_text.tag_delete(tag)
+        
         full_data = result_data.get('FullData', {})
         
         # 기본 정보
         info_text = "=== 파트넘버 상세정보 ===\n\n"
+        
+        # 데이터 출처 표시
+        source = full_data.get('Source', 'API')
+        info_text += f"데이터 출처: {source}\n"
+        if source == 'Database':
+            info_text += f"생성일시: {full_data.get('CreatedAt', 'N/A')}\n"
+            info_text += f"수정일시: {full_data.get('UpdatedAt', 'N/A')}\n"
+        info_text += "\n"
+        
         info_text += f"Row: {result_data.get('Row', 'N/A')}\n"
         info_text += f"파트넘버: {result_data.get('PartNumber', 'N/A')}\n"
         info_text += f"제조업체: {result_data.get('Manufacturer', 'N/A')}\n"
         info_text += f"마운팅타입: {result_data.get('MountingType', 'N/A')}\n\n"
         
-        # 추가 정보가 있으면 표시
+        self.detail_text.insert(tk.END, info_text)
+        
+        # URL 정보 처리 (링크로 표시)
         if 'error' not in full_data:
-            info_text += "--- 추가 정보 ---\n"
+            self.detail_text.insert(tk.END, "--- 추가 정보 ---\n")
+            
+            # 제품 URL
+            product_url = full_data.get('ProductUrl', '')
+            if product_url:
+                self.detail_text.insert(tk.END, "제품 상세정보: ")
+                url_start = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, product_url)
+                url_end = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, "\n")
+                
+                # 링크 태그 생성 및 적용
+                tag_name = f"product_url_{id(product_url)}"
+                self.detail_text.tag_add(tag_name, url_start, url_end)
+                self.detail_text.tag_config(tag_name, foreground="blue", underline=True)
+                self.detail_text.tag_bind(tag_name, "<Button-1>", lambda e, url=product_url: self.open_url(url))
+                self.detail_text.tag_bind(tag_name, "<Enter>", lambda e: self.detail_text.config(cursor="hand2"))
+                self.detail_text.tag_bind(tag_name, "<Leave>", lambda e: self.detail_text.config(cursor=""))
+            
+            # 데이터시트 URL
+            datasheet_url = full_data.get('DatasheetUrl', '')
+            if datasheet_url:
+                self.detail_text.insert(tk.END, "데이터시트 URL: ")
+                url_start = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, datasheet_url)
+                url_end = self.detail_text.index(tk.INSERT)
+                self.detail_text.insert(tk.END, "\n")
+                
+                # 링크 태그 생성 및 적용
+                tag_name = f"datasheet_url_{id(datasheet_url)}"
+                self.detail_text.tag_add(tag_name, url_start, url_end)
+                self.detail_text.tag_config(tag_name, foreground="blue", underline=True)
+                self.detail_text.tag_bind(tag_name, "<Button-1>", lambda e, url=datasheet_url: self.open_url(url))
+                self.detail_text.tag_bind(tag_name, "<Enter>", lambda e: self.detail_text.config(cursor="hand2"))
+                self.detail_text.tag_bind(tag_name, "<Leave>", lambda e: self.detail_text.config(cursor=""))
+            
+            # 기타 정보
             for key, value in full_data.items():
-                if key not in ['Manufacturer', 'MountingType']:  # 이미 표시한 항목 제외
+                # 이미 표시한 항목이나 URL 항목 제외
+                if key not in ['Manufacturer', 'MountingType', 'ProductUrl', 'DatasheetUrl', 'Source', 'CreatedAt', 'UpdatedAt']:
                     # 딕셔너리나 리스트인 경우 문자열로 변환
                     if isinstance(value, dict):
                         value_str = ", ".join([f"{k}: {v}" for k, v in value.items()])
-                        info_text += f"{key}: {value_str}\n"
+                        self.detail_text.insert(tk.END, f"{key}: {value_str}\n")
                     elif isinstance(value, list):
                         value_str = ", ".join([str(v) for v in value])
-                        info_text += f"{key}: {value_str}\n"
+                        self.detail_text.insert(tk.END, f"{key}: {value_str}\n")
                     else:
-                        info_text += f"{key}: {value}\n"
+                        self.detail_text.insert(tk.END, f"{key}: {value}\n")
         else:
-            info_text += f"\n오류: {full_data.get('error', '알 수 없는 오류')}\n"
+            self.detail_text.insert(tk.END, f"\n오류: {full_data.get('error', '알 수 없는 오류')}\n")
         
-        self.detail_text.insert(1.0, info_text)
         # 텍스트 위젯을 다시 읽기 전용으로 변경
         self.detail_text.config(state=tk.DISABLED)
+    
+    def open_url(self, url):
+        """웹브라우저에서 URL 열기"""
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("오류", f"URL을 열 수 없습니다:\n{url}\n\n{str(e)}")
     
     def check_api_config_after_setup(self):
         """유저폼 완료 후 API 설정 확인"""
@@ -867,6 +990,138 @@ class DigikeyViewerApp:
         cancel_btn = ttk.Button(button_frame, text="취소", command=settings_window.destroy, width=18)
         cancel_btn.pack(side=tk.LEFT, padx=10, expand=True)
     
+    def update_api_stats_label(self):
+        """API 통계 라벨 업데이트"""
+        if hasattr(self, 'api_stats_label') and hasattr(self, 'part_db') and self.part_db:
+            try:
+                today_calls = self.part_db.get_today_api_calls()
+                remaining = max(0, self.api_daily_limit - today_calls)
+                self.api_stats_label.config(
+                    text=f"오늘 API 호출: {today_calls}/{self.api_daily_limit} (남은: {remaining})",
+                    foreground="red" if remaining < 100 else "blue"
+                )
+            except:
+                pass
+    
+    def show_db_stats(self):
+        """데이터베이스 통계 정보 표시"""
+        if not hasattr(self, 'part_db') or not self.part_db:
+            messagebox.showwarning("경고", "데이터베이스가 초기화되지 않았습니다.")
+            return
+        
+        try:
+            stats = self.part_db.get_stats()
+            today_calls = stats.get('today_api_calls', 0)
+            remaining = max(0, self.api_daily_limit - today_calls)
+            
+            messagebox.showinfo(
+                "데이터베이스 통계",
+                f"파트넘버 데이터베이스 통계\n\n"
+                f"총 저장된 파트넘버: {stats.get('total_parts', 0):,}개\n"
+                f"제조사 수: {stats.get('total_manufacturers', 0):,}개\n"
+                f"마운팅 타입 수: {stats.get('total_mounting_types', 0):,}개\n\n"
+                f"오늘 API 호출: {today_calls}/{self.api_daily_limit}회\n"
+                f"남은 호출: {remaining}회\n\n"
+                f"※ 데이터베이스 파일: parts_cache.db"
+            )
+        except Exception as e:
+            messagebox.showerror("오류", f"통계 정보를 가져오는 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def show_api_stats(self):
+        """API 호출 통계 상세 정보 표시"""
+        if not hasattr(self, 'part_db') or not self.part_db:
+            messagebox.showwarning("경고", "데이터베이스가 초기화되지 않았습니다.")
+            return
+        
+        try:
+            # 최근 30일 통계 조회
+            recent_stats = self.part_db.get_api_call_stats(limit=30)
+            today_calls = self.part_db.get_today_api_calls()
+            remaining = max(0, self.api_daily_limit - today_calls)
+            
+            # 통계 윈도우 생성
+            stats_window = tk.Toplevel(self.root)
+            stats_window.title("API 호출 통계")
+            stats_window.geometry("500x600")
+            stats_window.transient(self.root)
+            
+            # 창 중앙 배치
+            stats_window.update_idletasks()
+            x = (stats_window.winfo_screenwidth() // 2) - (stats_window.winfo_width() // 2)
+            y = (stats_window.winfo_screenheight() // 2) - (stats_window.winfo_height() // 2)
+            stats_window.geometry(f"+{x}+{y}")
+            
+            # 메인 프레임
+            main_frame = ttk.Frame(stats_window, padding="20")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # 제목
+            ttk.Label(main_frame, text="API 호출 통계", font=("Arial", 14, "bold")).pack(pady=(0, 10))
+            
+            # 오늘 통계 프레임
+            today_frame = ttk.LabelFrame(main_frame, text="오늘 통계", padding="10")
+            today_frame.pack(fill=tk.X, pady=10)
+            
+            ttk.Label(today_frame, text=f"총 호출: {today_calls}회", font=("Arial", 11)).pack(anchor=tk.W, pady=2)
+            ttk.Label(today_frame, text=f"일일 한도: {self.api_daily_limit}회", font=("Arial", 11)).pack(anchor=tk.W, pady=2)
+            ttk.Label(
+                today_frame, 
+                text=f"남은 호출: {remaining}회",
+                font=("Arial", 11, "bold"),
+                foreground="red" if remaining < 100 else "green"
+            ).pack(anchor=tk.W, pady=2)
+            
+            # 진행률 바
+            progress_frame = ttk.Frame(today_frame)
+            progress_frame.pack(fill=tk.X, pady=5)
+            
+            progress_bar = ttk.Progressbar(
+                progress_frame, 
+                length=400, 
+                mode='determinate',
+                maximum=self.api_daily_limit,
+                value=today_calls
+            )
+            progress_bar.pack(fill=tk.X)
+            
+            percentage = (today_calls / self.api_daily_limit * 100) if self.api_daily_limit > 0 else 0
+            ttk.Label(progress_frame, text=f"{percentage:.1f}% 사용", font=("Arial", 9)).pack(anchor=tk.E, pady=2)
+            
+            # 최근 호출 통계 프레임
+            history_frame = ttk.LabelFrame(main_frame, text="최근 30일 호출 이력", padding="10")
+            history_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+            
+            # 트리뷰 및 스크롤바
+            scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL)
+            
+            stats_tree = ttk.Treeview(
+                history_frame,
+                columns=('date', 'calls'),
+                show='headings',
+                yscrollcommand=scrollbar.set,
+                height=15
+            )
+            scrollbar.config(command=stats_tree.yview)
+            
+            stats_tree.heading('date', text='날짜')
+            stats_tree.heading('calls', text='호출 횟수')
+            
+            stats_tree.column('date', width=200, anchor=tk.CENTER)
+            stats_tree.column('calls', width=150, anchor=tk.CENTER)
+            
+            # 데이터 삽입
+            for stat in recent_stats:
+                stats_tree.insert('', tk.END, values=(stat['date'], f"{stat['count']:,}회"))
+            
+            stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # 닫기 버튼
+            ttk.Button(main_frame, text="닫기", command=stats_window.destroy, width=15).pack(pady=10)
+            
+        except Exception as e:
+            messagebox.showerror("오류", f"API 통계를 가져오는 중 오류가 발생했습니다:\n{str(e)}")
+    
     def on_closing(self):
         """프로그램 종료 처리"""
         # 열려있는 모든 Toplevel 윈도우 닫기
@@ -876,6 +1131,10 @@ class DigikeyViewerApp:
                     widget.destroy()
                 except:
                     pass
+        
+        # 데이터베이스 연결 종료
+        if hasattr(self, 'part_db') and self.part_db:
+            self.part_db.close()
         
         # 메인 윈도우 종료
         self.root.quit()

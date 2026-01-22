@@ -48,3 +48,8 @@ config.txt
 # 임시 파일
 *.tmp
 *.bak
+
+# 데이터베이스 파일
+*.db
+*.sqlite
+*.sqlite3

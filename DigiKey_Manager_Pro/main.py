@@ -1,7 +1,7 @@
 """
 디지키 API를 사용한 파트넘버 조회 애플리케이션
 엑셀 파일에서 시트를 선택하고, 파트넘버를 더블클릭하여 조회하는 GUI 프로그램
-버전 1.2.4 - 조회 진행 상황 표시 및 조회 실패 파트넘버 웹 검색 링크 추가
+버전 1.2.5 - 조회 실패 시 파트넘버 수정 기능 추가
 """
 
 import tkinter as tk
@@ -19,7 +19,7 @@ class DigikeyViewerApp:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.4")
+        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.5")
         self.root.geometry("1200x700")
         
         # API 일일 호출 제한 (디지키 Product Information API)
@@ -473,6 +473,311 @@ class DigikeyViewerApp:
             values = [str(val) for val in row.values]
             self.tree1.insert("", tk.END, values=values, iid=index)
     
+    def clean_part_number(self, part_number: str) -> str:
+        """
+        파트넘버 기본 정리 (안전한 정리만 수행)
+        
+        Args:
+            part_number: 원본 파트넘버
+            
+        Returns:
+            str: 정리된 파트넘버
+        """
+        if not part_number:
+            return part_number
+        
+        # 앞뒤 공백 제거
+        cleaned = part_number.strip()
+        
+        # 줄바꿈, 탭 문자 제거
+        cleaned = cleaned.replace('\n', '').replace('\r', '').replace('\t', '')
+        
+        # 연속된 공백을 하나로 (단, 파트넘버 내부 공백은 유지)
+        # 예: "ABC  123" -> "ABC 123" (너무 공격적이지 않게)
+        
+        return cleaned
+    
+    def is_query_failed(self, result: dict) -> bool:
+        """
+        조회 결과가 실패인지 판단
+        
+        Args:
+            result: 조회 결과 딕셔너리
+            
+        Returns:
+            bool: 실패 여부
+        """
+        if not result:
+            return True
+        
+        # Manufacturer가 "검색 결과 없음"인 경우
+        if result.get('Manufacturer') == '검색 결과 없음':
+            return True
+        
+        # Error 필드가 있는 경우
+        if 'Error' in result or 'error' in result:
+            return True
+        
+        # Manufacturer가 "API 오류" 또는 "조회 실패"인 경우
+        manufacturer = result.get('Manufacturer', '')
+        if manufacturer in ['API 오류', '조회 실패']:
+            return True
+        
+        return False
+    
+    def show_part_number_edit_dialog(self, original_part_number: str, row_index: int) -> tuple:
+        """
+        조회 실패 시 파트넘버 수정 다이얼로그 표시
+        
+        Args:
+            original_part_number: 원본 파트넘버
+            row_index: 행 인덱스
+            
+        Returns:
+            tuple: (수정된 파트넘버, 재조회 여부)
+                   사용자가 취소하면 (None, False) 반환
+        """
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title("파트넘버 수정")
+        edit_window.geometry("500x250")
+        edit_window.resizable(False, False)
+        
+        # 창 중앙 배치
+        edit_window.update_idletasks()
+        x = (edit_window.winfo_screenwidth() // 2) - (edit_window.winfo_width() // 2)
+        y = (edit_window.winfo_screenheight() // 2) - (edit_window.winfo_height() // 2)
+        edit_window.geometry(f"+{x}+{y}")
+        
+        # 모달 다이얼로그로 만들기
+        edit_window.transient(self.root)
+        edit_window.grab_set()
+        edit_window.focus_set()
+        edit_window.lift()
+        
+        # 메인 프레임
+        main_frame = ttk.Frame(edit_window, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 제목
+        title_label = ttk.Label(
+            main_frame, 
+            text="파트넘버 조회 실패", 
+            font=("Arial", 12, "bold")
+        )
+        title_label.pack(pady=(0, 10))
+        
+        # 안내 메시지
+        info_label = ttk.Label(
+            main_frame,
+            text=f"파트넘버 '{original_part_number}' (Row {row_index})를 찾을 수 없습니다.\n"
+                 f"파트넘버에 오타나 불필요한 문자가 있을 수 있습니다.\n"
+                 f"수정하시겠습니까?",
+            justify=tk.LEFT,
+            font=("Arial", 9)
+        )
+        info_label.pack(pady=(0, 15))
+        
+        # 입력 프레임
+        input_frame = ttk.Frame(main_frame)
+        input_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(input_frame, text="파트넘버:", width=12).pack(side=tk.LEFT, padx=5)
+        part_var = tk.StringVar(value=original_part_number)
+        part_entry = ttk.Entry(input_frame, textvariable=part_var, width=40)
+        part_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        part_entry.select_range(0, tk.END)  # 전체 선택
+        part_entry.focus()
+        
+        # 버튼 프레임
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=20)
+        
+        result = [None, False]  # [수정된 파트넘버, 재조회 여부]
+        
+        def on_retry():
+            """재조회 버튼 클릭"""
+            modified = part_var.get().strip()
+            if modified and modified != original_part_number:
+                result[0] = modified
+                result[1] = True
+            else:
+                result[0] = original_part_number
+                result[1] = True
+            edit_window.destroy()
+        
+        def on_skip():
+            """건너뛰기 버튼 클릭"""
+            result[0] = original_part_number
+            result[1] = False
+            edit_window.destroy()
+        
+        def on_cancel():
+            """취소 버튼 클릭"""
+            result[0] = None
+            result[1] = False
+            edit_window.destroy()
+        
+        # Enter 키로 재조회
+        part_entry.bind('<Return>', lambda e: on_retry())
+        
+        ttk.Button(button_frame, text="재조회", command=on_retry, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="건너뛰기", command=on_skip, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="취소", command=on_cancel, width=12).pack(side=tk.LEFT, padx=5)
+        
+        # 창 닫기 프로토콜
+        edit_window.protocol("WM_DELETE_WINDOW", on_cancel)
+        
+        # 다이얼로그가 닫힐 때까지 대기
+        edit_window.wait_window()
+        
+        return tuple(result)
+    
+    def query_part_with_retry(self, part_number: str, row_index: int, progress_window=None) -> tuple:
+        """
+        파트넘버 조회 (실패 시 정리 및 재시도, 사용자 수정 옵션 제공)
+        
+        Args:
+            part_number: 조회할 파트넘버
+            row_index: 행 인덱스 (다이얼로그 표시용)
+            progress_window: 진행 상황 창 (선택적)
+            
+        Returns:
+            tuple: (조회 결과 dict, API 호출 횟수)
+        """
+        original_part_number = part_number
+        api_call_count = 0  # 실제 API 호출 횟수 추적
+        
+        # 1차: 원본 파트넘버로 조회
+        result = None
+        
+        # 먼저 DB에서 조회
+        db_result = self.part_db.get_part(part_number)
+        if db_result:
+            # DB에 결과가 있으면 (성공/실패 상관없이) 그 결과를 반환
+            # 이미 조회한 적이 있으므로 다시 API를 호출하지 않음
+            return (db_result, 0)  # DB에서 조회한 경우 API 호출 없음
+        
+        # DB에 없는 경우에만 API 조회
+        try:
+            api_result = self.digikey_api.search_part(part_number)
+            if api_result:
+                api_call_count += 1
+                self.part_db.increment_api_call()
+                if not self.is_query_failed(api_result):
+                    # 성공한 경우 DB에 저장
+                    self.part_db.save_part(api_result)
+                    return (api_result, api_call_count)
+                # 실패한 경우도 DB에 저장 (중복 조회 방지)
+                result = api_result
+                self.part_db.save_part(api_result)
+        except RateLimitExceeded:
+            raise  # 상위로 전달
+        except Exception as e:
+            result = {
+                'PartNumber': part_number,
+                'Manufacturer': '조회 실패',
+                'MountingType': '조회 실패',
+                'error': str(e)
+            }
+            # API 호출은 했지만 예외가 발생한 경우도 저장
+            if api_call_count > 0:
+                self.part_db.save_part(result)
+        
+        # 조회 실패 시
+        if self.is_query_failed(result):
+            # 2차: 기본 정리 후 재조회
+            cleaned_part = self.clean_part_number(part_number)
+            if cleaned_part != part_number:
+                # 정리된 버전으로 재조회 시도
+                try:
+                    cleaned_result = self.digikey_api.search_part(cleaned_part)
+                    if cleaned_result:
+                        api_call_count += 1
+                        self.part_db.increment_api_call()
+                        if not self.is_query_failed(cleaned_result):
+                            # 성공한 경우 DB에 저장
+                            self.part_db.save_part(cleaned_result)
+                            return (cleaned_result, api_call_count)
+                        # 실패한 경우도 DB에 저장 (중복 조회 방지)
+                        self.part_db.save_part(cleaned_result)
+                except RateLimitExceeded:
+                    raise
+                except Exception:
+                    pass  # 정리된 버전도 실패하면 계속 진행
+            
+            # 3차: 사용자에게 수정 요청
+            # 진행 창이 있으면 일시적으로 숨김
+            if progress_window:
+                progress_window.withdraw()
+            
+            modified_part, should_retry = self.show_part_number_edit_dialog(
+                original_part_number, row_index
+            )
+            
+            # 진행 창 다시 표시
+            if progress_window:
+                progress_window.deiconify()
+            
+            if modified_part and should_retry:
+                # 수정된 파트넘버로 재조회
+                try:
+                    modified_result = self.digikey_api.search_part(modified_part)
+                    if modified_result:
+                        api_call_count += 1
+                        self.part_db.increment_api_call()
+                        if not self.is_query_failed(modified_result):
+                            # 성공한 경우 DB에 저장
+                            self.part_db.save_part(modified_result)
+                            return (modified_result, api_call_count)
+                        # 여전히 실패한 경우도 DB에 저장 (중복 조회 방지)
+                        self.part_db.save_part(modified_result)
+                        return (modified_result, api_call_count)
+                except RateLimitExceeded:
+                    raise
+                except Exception as e:
+                    error_result = {
+                        'PartNumber': modified_part,
+                        'Manufacturer': '조회 실패',
+                        'MountingType': '조회 실패',
+                        'error': str(e)
+                    }
+                    # 예외 발생한 경우도 저장
+                    self.part_db.save_part(error_result)
+                    return (error_result, api_call_count)
+            elif modified_part:
+                # 건너뛰기 선택한 경우: 이미 API를 호출했으므로 실패 결과를 DB에 저장
+                final_result = result if result else {
+                    'PartNumber': original_part_number,
+                    'Manufacturer': '검색 결과 없음',
+                    'MountingType': 'N/A',
+                    'Description': '파트넘버를 찾을 수 없습니다.'
+                }
+                # API를 호출한 경우에만 저장 (중복 조회 방지)
+                if api_call_count > 0:
+                    self.part_db.save_part(final_result)
+                return (final_result, api_call_count)
+            else:
+                # 취소 선택한 경우 원본 결과 반환
+                final_result = result if result else {
+                    'PartNumber': original_part_number,
+                    'Manufacturer': '검색 결과 없음',
+                    'MountingType': 'N/A',
+                    'Description': '파트넘버를 찾을 수 없습니다.'
+                }
+                return (final_result, api_call_count)
+        
+        # 결과가 있으면 반환 (실패한 경우도 포함)
+        final_result = result if result else {
+            'PartNumber': original_part_number,
+            'Manufacturer': '검색 결과 없음',
+            'MountingType': 'N/A',
+            'Description': '파트넘버를 찾을 수 없습니다.'
+        }
+        # API를 호출한 경우 실패 결과도 DB에 저장 (중복 조회 방지)
+        if api_call_count > 0 and self.is_query_failed(final_result):
+            self.part_db.save_part(final_result)
+        return (final_result, api_call_count)
+    
     def on_part_double_click(self, event):
         """파트넘버 더블클릭 이벤트 처리"""
         selection = self.tree1.selection()
@@ -638,80 +943,72 @@ class DigikeyViewerApp:
                 
                 queried_count += 1
                 
-                # v1.2.4: 진행 상황 업데이트 (전체/조회 완료 개수 표시)
+                # v1.2.5: 진행 상황 업데이트 (전체/조회 완료 개수 표시)
                 progress_count_label.config(text=f"조회 진행: {queried_count} / {total_parts}개")
                 progress_detail.config(text=f"조회 중: {part_number} (Row {idx})\nDB: {db_hits}건 | API: {api_calls}건")
                 progress_bar['value'] = queried_count
                 self.root.update()
                 
                 result = None
+                part_api_calls = 0  # 이 파트넘버 조회 시 실제 API 호출 횟수
                 
-                # 1. 먼저 데이터베이스에서 조회
-                db_result = self.part_db.get_part(part_number)
-                if db_result:
-                    result = db_result
-                    db_hits += 1
-                else:
-                    # 2. DB에 없으면 디지키 API로 조회
-                    try:
-                        api_result = self.digikey_api.search_part(part_number)
-                        if api_result:
-                            api_calls += 1
-                            result = api_result
+                # v1.2.5: 새로운 재시도 로직 사용 (정리 → 재조회 → 사용자 수정)
+                try:
+                    # DB에서 먼저 조회 (성공한 경우만)
+                    db_result = self.part_db.get_part(part_number)
+                    if db_result and not self.is_query_failed(db_result):
+                        result = db_result
+                        db_hits += 1
+                    else:
+                        # DB에 없거나 실패한 경우 재시도 로직 사용
+                        result, part_api_calls = self.query_part_with_retry(part_number, idx, progress_window)
+                        api_calls += part_api_calls  # 실제 API 호출 횟수 추가
                             
-                            # API 호출 횟수 증가 (성공/실패 여부와 관계없이)
-                            self.part_db.increment_api_call()
-                            
-                            # API 조회 결과를 데이터베이스에 저장
-                            # v1.2.3: 조회 실패한 파트넘버도 저장하여 중복 조회 방지
-                            if 'Error' not in api_result:
-                                # 검색 결과 없음, API 오류 등도 모두 저장
-                                self.part_db.save_part(api_result)
-                    except RateLimitExceeded as e:
-                        # API 호출 한도 초과 시 조회 중단
-                        progress_window.destroy()
-                        
-                        # 재시도 시간 정보 포함 메시지
-                        retry_info = ""
-                        if e.retry_after:
-                            hours = e.retry_after // 3600
-                            minutes = (e.retry_after % 3600) // 60
-                            if hours > 0:
-                                retry_info = f"\n\n재시도 가능 시간: 약 {hours}시간 {minutes}분 후"
-                            elif minutes > 0:
-                                retry_info = f"\n\n재시도 가능 시간: 약 {minutes}분 후"
-                            else:
-                                retry_info = f"\n\n재시도 가능 시간: 약 {e.retry_after}초 후"
-                        
-                        messagebox.showwarning(
-                            "API 호출 한도 초과",
-                            f"API 일일 호출 제한에 도달했습니다.\n\n"
-                            f"조회가 중단되었습니다.\n"
-                            f"현재까지 조회된 결과: {len(query_results)}개\n"
-                            f"DB 조회: {db_hits}건 | API 호출: {api_calls}건\n\n"
-                            f"상세 정보:\n{str(e)}{retry_info}\n\n"
-                            f"※ Product Information API 제한:\n"
-                            f"  - 일일 최대: 1,000회\n"
-                            f"  - 분당 최대: 120회"
-                        )
-                        
-                        # 현재까지 조회된 결과 표시
-                        if query_results:
-                            self.query_results = query_results
-                            self.display_query_results()
-                            self.notebook.select(1)
-                        
-                        return  # 조회 중단
-                    except Exception as e:
-                        # API 오류 시에도 기본 정보는 추가 (오류 메시지 포함)
-                        error_msg = str(e)
-                        print(f"파트넘버 조회 오류 ({part_number}): {error_msg}")  # 콘솔에 오류 출력
-                        result = {
-                            'PartNumber': part_number,
-                            'Manufacturer': '조회 실패',
-                            'MountingType': '조회 실패',
-                            'error': error_msg
-                        }
+                except RateLimitExceeded as e:
+                    # API 호출 한도 초과 시 조회 중단
+                    progress_window.destroy()
+                    
+                    # 재시도 시간 정보 포함 메시지
+                    retry_info = ""
+                    if e.retry_after:
+                        hours = e.retry_after // 3600
+                        minutes = (e.retry_after % 3600) // 60
+                        if hours > 0:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {hours}시간 {minutes}분 후"
+                        elif minutes > 0:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {minutes}분 후"
+                        else:
+                            retry_info = f"\n\n재시도 가능 시간: 약 {e.retry_after}초 후"
+                    
+                    messagebox.showwarning(
+                        "API 호출 한도 초과",
+                        f"API 일일 호출 제한에 도달했습니다.\n\n"
+                        f"조회가 중단되었습니다.\n"
+                        f"현재까지 조회된 결과: {len(query_results)}개\n"
+                        f"DB 조회: {db_hits}건 | API 호출: {api_calls}건\n\n"
+                        f"상세 정보:\n{str(e)}{retry_info}\n\n"
+                        f"※ Product Information API 제한:\n"
+                        f"  - 일일 최대: 1,000회\n"
+                        f"  - 분당 최대: 120회"
+                    )
+                    
+                    # 현재까지 조회된 결과 표시
+                    if query_results:
+                        self.query_results = query_results
+                        self.display_query_results()
+                        self.notebook.select(1)
+                    
+                    return  # 조회 중단
+                except Exception as e:
+                    # 기타 오류 시에도 기본 정보는 추가 (오류 메시지 포함)
+                    error_msg = str(e)
+                    print(f"파트넘버 조회 오류 ({part_number}): {error_msg}")  # 콘솔에 오류 출력
+                    result = {
+                        'PartNumber': part_number,
+                        'Manufacturer': '조회 실패',
+                        'MountingType': '조회 실패',
+                        'error': error_msg
+                    }
                 
                 # 결과가 있으면 query_results에 추가
                 if result:

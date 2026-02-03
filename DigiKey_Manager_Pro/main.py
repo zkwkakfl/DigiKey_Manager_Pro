@@ -1,9 +1,10 @@
 """
 디지키 API를 사용한 파트넘버 조회 애플리케이션
 엑셀 파일에서 시트를 선택하고, 파트넘버를 더블클릭하여 조회하는 GUI 프로그램
-버전 1.2.5 - 조회 실패 시 파트넘버 수정 기능 추가
+버전 1.2.6 - 유사 자재 목록 선택, 조회 실패 시 Google 웹 검색 기능
 """
 
+import difflib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
@@ -13,13 +14,17 @@ from excel_handler import ExcelHandler
 from digikey_api import DigikeyAPIClient, RateLimitExceeded
 from database import PartDatabase
 
+# 유사 자재: 최소 유사도(0~1), 목록 최대 개수
+SIMILAR_PARTS_MIN_RATIO = 0.6
+SIMILAR_PARTS_MAX_COUNT = 10
+
 
 class DigikeyViewerApp:
     """메인 애플리케이션 클래스"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.5")
+        self.root.title("디지키 파트넘버 조회 프로그램 v1.2.6")
         self.root.geometry("1200x700")
         
         # API 일일 호출 제한 (디지키 Product Information API)
@@ -368,7 +373,7 @@ class DigikeyViewerApp:
                 setup_window.destroy()
                 self.root.quit()
         
-        ttk.Button(button_frame, text="확인", command=confirm_setup, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="확인", command=confirm_setup, width=15,).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="취소", command=cancel_setup, width=15).pack(side=tk.LEFT, padx=5)
         
         # 파일 변경 시 시트 목록 업데이트
@@ -525,21 +530,102 @@ class DigikeyViewerApp:
         
         return False
     
+    def _similarity_ratio(self, a: str, b: str) -> float:
+        """두 문자열의 유사도 반환 (0~1). 대소문자 무시."""
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+    
+    def show_similar_parts_selection_dialog(self, original_part_number: str, row_index: int, similar_list: list) -> tuple:
+        """
+        유사 자재 목록을 보여주고 사용자가 하나 선택하도록 함.
+        
+        Args:
+            original_part_number: 원본 파트넘버
+            row_index: 행 인덱스
+            similar_list: 유사 자재 dict 목록 (각 dict에 PartNumber, Manufacturer, MountingType, Description, Similarity 등)
+            
+        Returns:
+            tuple: (선택한 결과 dict, True) 또는 (None, False) 취소 시
+        """
+        if not similar_list:
+            return (None, False)
+        sel_window = tk.Toplevel(self.root)
+        sel_window.title("유사 자재 선택")
+        sel_window.geometry("750x400")
+        sel_window.resizable(True, True)
+        sel_window.transient(self.root)
+        sel_window.grab_set()
+        sel_window.focus_set()
+        sel_window.lift()
+        main_frame = ttk.Frame(sel_window, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(main_frame, text=f"'{original_part_number}' (Row {row_index})에 대한 유사 자재입니다. 하나를 선택하세요.", font=("Arial", 10, "bold")).pack(pady=(0, 10))
+        columns = ("similarity", "part", "manufacturer", "mounting", "description")
+        tree = ttk.Treeview(main_frame, columns=columns, show="headings", height=12, selectmode="browse")
+        tree.heading("similarity", text="유사도(%)")
+        tree.heading("part", text="파트넘버")
+        tree.heading("manufacturer", text="제조사")
+        tree.heading("mounting", text="마운팅타입")
+        tree.heading("description", text="설명")
+        tree.column("similarity", width=80)
+        tree.column("part", width=150)
+        tree.column("manufacturer", width=120)
+        tree.column("mounting", width=100)
+        tree.column("description", width=250)
+        scroll_y = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scroll_y.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        for i, item in enumerate(similar_list):
+            sim = item.get("Similarity", 0)
+            pct = f"{sim * 100:.0f}%" if isinstance(sim, (int, float)) else str(sim)
+            desc = (item.get("Description") or "N/A")[:50]
+            if len((item.get("Description") or "")) > 50:
+                desc += "..."
+            tree.insert("", tk.END, iid=i, values=(
+                pct,
+                item.get("PartNumber", ""),
+                item.get("Manufacturer", "N/A"),
+                item.get("MountingType", "N/A"),
+                desc
+            ))
+        selected_result = [None]
+        def on_ok():
+            sel = tree.selection()
+            if sel:
+                idx = int(sel[0])
+                if 0 <= idx < len(similar_list):
+                    selected_result[0] = similar_list[idx]
+            sel_window.destroy()
+        def on_cancel():
+            selected_result[0] = None
+            sel_window.destroy()
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="선택", command=on_ok, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="취소", command=on_cancel, width=12).pack(side=tk.LEFT, padx=5)
+        sel_window.protocol("WM_DELETE_WINDOW", on_cancel)
+        tree.bind("<Double-1>", lambda e: on_ok())
+        sel_window.wait_window()
+        return (selected_result[0], selected_result[0] is not None)
+    
     def show_part_number_edit_dialog(self, original_part_number: str, row_index: int) -> tuple:
         """
-        조회 실패 시 파트넘버 수정 다이얼로그 표시
+        조회 실패 시 파트넘버 수정 및 웹 검색 다이얼로그 표시
         
         Args:
             original_part_number: 원본 파트넘버
             row_index: 행 인덱스
             
         Returns:
-            tuple: (수정된 파트넘버, 재조회 여부)
+            tuple: (수정된 파트넘버, 웹 검색 여부)
                    사용자가 취소하면 (None, False) 반환
+                   웹 검색을 했을 때는 (파트넘버, False) 반환 (API 재조회하지 않음)
         """
         edit_window = tk.Toplevel(self.root)
-        edit_window.title("파트넘버 수정")
-        edit_window.geometry("500x250")
+        edit_window.title("파트넘버 조회 실패")
+        edit_window.geometry("550x280")
         edit_window.resizable(False, False)
         
         # 창 중앙 배치
@@ -571,7 +657,7 @@ class DigikeyViewerApp:
             main_frame,
             text=f"파트넘버 '{original_part_number}' (Row {row_index})를 찾을 수 없습니다.\n"
                  f"파트넘버에 오타나 불필요한 문자가 있을 수 있습니다.\n"
-                 f"수정하시겠습니까?",
+                 f"수정 후 Google에서 검색하거나 건너뛸 수 있습니다.",
             justify=tk.LEFT,
             font=("Arial", 9)
         )
@@ -592,17 +678,22 @@ class DigikeyViewerApp:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(pady=20)
         
-        result = [None, False]  # [수정된 파트넘버, 재조회 여부]
+        result = [None, False]  # [수정된 파트넘버, 웹 검색 여부]
         
-        def on_retry():
-            """재조회 버튼 클릭"""
+        def on_web_search():
+            """웹에서 검색 버튼 클릭"""
             modified = part_var.get().strip()
-            if modified and modified != original_part_number:
-                result[0] = modified
-                result[1] = True
-            else:
-                result[0] = original_part_number
-                result[1] = True
+            if not modified:
+                modified = original_part_number
+            
+            # Google에서 디지키 사이트 검색
+            search_query = f"{modified}"
+            google_url = f"https://www.google.com/search?q={search_query}"
+            webbrowser.open(google_url)
+            
+            # 웹 검색을 했으므로 결과 저장 (API 재조회하지 않음)
+            result[0] = modified
+            result[1] = False  # False = API 재조회하지 않음
             edit_window.destroy()
         
         def on_skip():
@@ -617,10 +708,10 @@ class DigikeyViewerApp:
             result[1] = False
             edit_window.destroy()
         
-        # Enter 키로 재조회
-        part_entry.bind('<Return>', lambda e: on_retry())
+        # Enter 키로 웹 검색
+        part_entry.bind('<Return>', lambda e: on_web_search())
         
-        ttk.Button(button_frame, text="재조회", command=on_retry, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="웹에서 검색", command=on_web_search, width=14).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="건너뛰기", command=on_skip, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="취소", command=on_cancel, width=12).pack(side=tk.LEFT, padx=5)
         
@@ -634,7 +725,7 @@ class DigikeyViewerApp:
     
     def query_part_with_retry(self, part_number: str, row_index: int, progress_window=None) -> tuple:
         """
-        파트넘버 조회 (실패 시 정리 및 재시도, 사용자 수정 옵션 제공)
+        파트넘버 조회 (실패 시 정리 및 재시도, 웹 검색 옵션 제공)
         
         Args:
             part_number: 조회할 파트넘버
@@ -705,12 +796,42 @@ class DigikeyViewerApp:
                 except Exception:
                     pass  # 정리된 버전도 실패하면 계속 진행
             
-            # 3차: 사용자에게 수정 요청
+            # 2.5차: 유사 자재 검색 (최대 10개, 유사도 60% 이상) → 사용자 선택
+            try:
+                similar_raw = self.digikey_api.search_part_multiple(original_part_number, 15)
+                api_call_count += 1
+                self.part_db.increment_api_call()
+                similar_with_ratio = []
+                for r in similar_raw:
+                    ratio = self._similarity_ratio(original_part_number, r.get("PartNumber", ""))
+                    if ratio >= SIMILAR_PARTS_MIN_RATIO:
+                        r_copy = dict(r)
+                        r_copy["Similarity"] = ratio
+                        similar_with_ratio.append(r_copy)
+                similar_with_ratio.sort(key=lambda x: x.get("Similarity", 0), reverse=True)
+                similar_filtered = similar_with_ratio[:SIMILAR_PARTS_MAX_COUNT]
+                if similar_filtered:
+                    if progress_window:
+                        progress_window.withdraw()
+                    selected_result, did_select = self.show_similar_parts_selection_dialog(
+                        original_part_number, row_index, similar_filtered
+                    )
+                    if progress_window:
+                        progress_window.deiconify()
+                    if did_select and selected_result:
+                        self.part_db.save_part(selected_result)
+                        return (selected_result, api_call_count)
+            except RateLimitExceeded:
+                raise
+            except Exception:
+                pass
+            
+            # 3차: 사용자에게 웹 검색 옵션 제공
             # 진행 창이 있으면 일시적으로 숨김
             if progress_window:
                 progress_window.withdraw()
             
-            modified_part, should_retry = self.show_part_number_edit_dialog(
+            modified_part, web_searched = self.show_part_number_edit_dialog(
                 original_part_number, row_index
             )
             
@@ -718,33 +839,8 @@ class DigikeyViewerApp:
             if progress_window:
                 progress_window.deiconify()
             
-            if modified_part and should_retry:
-                # 수정된 파트넘버로 재조회
-                try:
-                    modified_result = self.digikey_api.search_part(modified_part)
-                    if modified_result:
-                        api_call_count += 1
-                        self.part_db.increment_api_call()
-                        if not self.is_query_failed(modified_result):
-                            # 성공한 경우 DB에 저장
-                            self.part_db.save_part(modified_result)
-                            return (modified_result, api_call_count)
-                        # 여전히 실패한 경우도 DB에 저장 (중복 조회 방지)
-                        self.part_db.save_part(modified_result)
-                        return (modified_result, api_call_count)
-                except RateLimitExceeded:
-                    raise
-                except Exception as e:
-                    error_result = {
-                        'PartNumber': modified_part,
-                        'Manufacturer': '조회 실패',
-                        'MountingType': '조회 실패',
-                        'error': str(e)
-                    }
-                    # 예외 발생한 경우도 저장
-                    self.part_db.save_part(error_result)
-                    return (error_result, api_call_count)
-            elif modified_part:
+            # 웹 검색을 했거나 건너뛰기를 선택한 경우
+            if modified_part:
                 # 건너뛰기 선택한 경우: 이미 API를 호출했으므로 실패 결과를 DB에 저장
                 final_result = result if result else {
                     'PartNumber': original_part_number,
@@ -952,7 +1048,7 @@ class DigikeyViewerApp:
                 result = None
                 part_api_calls = 0  # 이 파트넘버 조회 시 실제 API 호출 횟수
                 
-                # v1.2.5: 새로운 재시도 로직 사용 (정리 → 재조회 → 사용자 수정)
+                # v1.2.6: 새로운 재시도 로직 사용 (정리 → 웹 검색 옵션 제공)
                 try:
                     # DB에서 먼저 조회 (성공한 경우만)
                     db_result = self.part_db.get_part(part_number)

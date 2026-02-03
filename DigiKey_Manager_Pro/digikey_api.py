@@ -7,7 +7,7 @@ import requests
 import json
 import os
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 class RateLimitExceeded(Exception):
@@ -236,6 +236,65 @@ class DigikeyAPIClient:
                     raise Exception(f"토큰 획득 중 인증 오류가 발생했습니다 (401): API 키와 환경 설정을 확인하세요.")
             raise Exception(f"토큰 획득 중 오류가 발생했습니다: {str(e)}")
     
+    def _product_to_result(self, product: dict, part_number: str) -> Dict:
+        """API 응답의 product 딕셔너리를 공통 결과 형식으로 변환"""
+        if isinstance(product, list) and len(product) > 0:
+            product = product[0]
+        if not isinstance(product, dict):
+            return {
+                "PartNumber": part_number,
+                "Manufacturer": "N/A",
+                "MountingType": "N/A",
+                "Description": "N/A",
+                "ProductUrl": "",
+                "DatasheetUrl": "",
+                "QuantityAvailable": 0,
+                "UnitPrice": 0
+            }
+        manufacturer = "N/A"
+        if "Manufacturer" in product:
+            if isinstance(product["Manufacturer"], dict):
+                manufacturer = product["Manufacturer"].get("Name") or product["Manufacturer"].get("Value", "N/A")
+            elif isinstance(product["Manufacturer"], str):
+                manufacturer = product["Manufacturer"]
+        description = "N/A"
+        if "DetailedDescription" in product:
+            desc_value = product.get("DetailedDescription")
+            if isinstance(desc_value, dict):
+                description = desc_value.get("DetailedDescription") or desc_value.get("ProductDescription") or "N/A"
+            elif isinstance(desc_value, str):
+                description = desc_value
+        elif "Description" in product:
+            desc_value = product.get("Description")
+            if isinstance(desc_value, dict):
+                description = desc_value.get("DetailedDescription") or desc_value.get("ProductDescription") or "N/A"
+            elif isinstance(desc_value, str):
+                description = desc_value
+        result = {
+            "PartNumber": product.get("DigiKeyPartNumber") or product.get("PartNumber") or part_number,
+            "Manufacturer": manufacturer,
+            "MountingType": "N/A",
+            "Description": description,
+            "ProductUrl": product.get("ProductUrl") or product.get("Url") or "",
+            "DatasheetUrl": product.get("PrimaryDatasheet") or product.get("DatasheetUrl") or "",
+            "QuantityAvailable": product.get("QuantityAvailable", 0),
+            "UnitPrice": 0
+        }
+        if "StandardPricing" in product and product["StandardPricing"]:
+            if isinstance(product["StandardPricing"], list) and len(product["StandardPricing"]) > 0:
+                result["UnitPrice"] = product["StandardPricing"][0].get("UnitPrice", 0)
+        params = product.get("Parameters", [])
+        if isinstance(params, list):
+            for param in params:
+                if isinstance(param, dict):
+                    param_text = param.get("ParameterText") or param.get("Parameter") or param.get("Name", "")
+                    if param_text == "Mounting Type":
+                        result["MountingType"] = param.get("ValueText") or param.get("Value", "N/A")
+                        break
+        elif isinstance(params, dict):
+            result["MountingType"] = params.get("MountingType") or params.get("Mounting Type", "N/A")
+        return result
+    
     def search_part(self, part_number: str) -> Optional[Dict]:
         """
         파트넘버로 제품 정보 검색
@@ -354,70 +413,7 @@ class DigikeyAPIClient:
                 search_results = data
             
             if search_results and len(search_results) > 0:
-                product = search_results[0]
-                
-                # product가 리스트인 경우 첫 번째 요소 사용
-                if isinstance(product, list) and len(product) > 0:
-                    product = product[0]
-                
-                # product가 딕셔너리가 아니면 오류
-                if not isinstance(product, dict):
-                    raise Exception(f"예상치 못한 응답 구조: product 타입이 {type(product)}입니다.")
-                
-                # 필요한 정보 추출
-                manufacturer = "N/A"
-                if "Manufacturer" in product:
-                    if isinstance(product["Manufacturer"], dict):
-                        # JSON 구조: {"Id": 478, "Name": "KYOCERA AVX"}
-                        manufacturer = product["Manufacturer"].get("Name") or product["Manufacturer"].get("Value", "N/A")
-                    elif isinstance(product["Manufacturer"], str):
-                        manufacturer = product["Manufacturer"]
-                
-                # Description 필드 처리 (딕셔너리인 경우 처리)
-                description = "N/A"
-                if "DetailedDescription" in product:
-                    desc_value = product.get("DetailedDescription")
-                    if isinstance(desc_value, dict):
-                        description = desc_value.get("DetailedDescription") or desc_value.get("ProductDescription") or "N/A"
-                    elif isinstance(desc_value, str):
-                        description = desc_value
-                elif "Description" in product:
-                    desc_value = product.get("Description")
-                    if isinstance(desc_value, dict):
-                        description = desc_value.get("DetailedDescription") or desc_value.get("ProductDescription") or "N/A"
-                    elif isinstance(desc_value, str):
-                        description = desc_value
-                
-                result = {
-                    "PartNumber": product.get("DigiKeyPartNumber") or product.get("PartNumber") or part_number,
-                    "Manufacturer": manufacturer,
-                    "MountingType": "N/A",
-                    "Description": description,
-                    "ProductUrl": product.get("ProductUrl") or product.get("Url") or "",
-                    "DatasheetUrl": product.get("PrimaryDatasheet") or product.get("DatasheetUrl") or "",
-                    "QuantityAvailable": product.get("QuantityAvailable", 0),
-                    "UnitPrice": 0
-                }
-                
-                # 가격 정보 추출
-                if "StandardPricing" in product and product["StandardPricing"]:
-                    if isinstance(product["StandardPricing"], list) and len(product["StandardPricing"]) > 0:
-                        result["UnitPrice"] = product["StandardPricing"][0].get("UnitPrice", 0)
-                
-                # Parameters에서 마운팅 타입 찾기
-                params = product.get("Parameters", [])
-                if isinstance(params, list):
-                    for param in params:
-                        if isinstance(param, dict):
-                            # JSON 구조: {"ParameterText": "Mounting Type", "ValueText": "Surface Mount"}
-                            param_text = param.get("ParameterText") or param.get("Parameter") or param.get("Name", "")
-                            if param_text == "Mounting Type":
-                                result["MountingType"] = param.get("ValueText") or param.get("Value", "N/A")
-                                break
-                elif isinstance(params, dict):
-                    result["MountingType"] = params.get("MountingType") or params.get("Mounting Type", "N/A")
-                
-                return result
+                return self._product_to_result(search_results[0], part_number)
             else:
                 # 검색 결과가 없는 경우
                 return {
@@ -453,6 +449,87 @@ class DigikeyAPIClient:
                 "MountingType": "N/A",
                 "Error": str(e)
             }
+    
+    def search_part_multiple(self, part_number: str, record_count: int = 15) -> List[Dict]:
+        """
+        키워드로 여러 개의 유사 제품 검색 (1회 API 호출)
+        
+        Args:
+            part_number: 검색 키워드(파트넘버)
+            record_count: 반환받을 최대 건수 (기본 15)
+            
+        Returns:
+            list: 제품 정보 딕셔너리 목록 (0개 이상). 오류 시 빈 목록.
+        """
+        if not self.is_configured():
+            return []
+        try:
+            token = self.get_access_token()
+            search_url = f"{self.base_url}/products/v4/search/keyword"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-DIGIKEY-Client-Id": self.client_id,
+                "X-DIGIKEY-Locale-Site": "US",
+                "X-DIGIKEY-Locale-Language": "en",
+                "X-DIGIKEY-Locale-Currency": "USD"
+            }
+            payload = {
+                "Keywords": part_number,
+                "RecordCount": min(record_count, 50),
+                "RecordStartPosition": 0
+            }
+            response = requests.post(search_url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 401:
+                try:
+                    error_data = response.json()
+                    if "expired" in error_data.get("detail", "").lower() or "Bearer token is expired" in error_data.get("detail", ""):
+                        if self.refresh_token:
+                            self.refresh_access_token()
+                            token = self.get_access_token()
+                            headers["Authorization"] = f"Bearer {token}"
+                            response = requests.post(search_url, headers=headers, json=payload, timeout=30)
+                        else:
+                            self.access_token = None
+                            self.token_expires_at = None
+                            token = self.get_access_token()
+                            headers["Authorization"] = f"Bearer {token}"
+                            response = requests.post(search_url, headers=headers, json=payload, timeout=30)
+                except Exception:
+                    return []
+            if response.status_code == 429:
+                try:
+                    retry_after = response.headers.get("Retry-After", "알 수 없음")
+                    retry_after_int = int(retry_after) if retry_after != "알 수 없음" else None
+                except Exception:
+                    retry_after_int = None
+                raise RateLimitExceeded("API 일일 호출 제한 초과", retry_after_int)
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            search_results = None
+            if "SearchResults" in data:
+                search_results = data["SearchResults"]
+            elif "Products" in data:
+                search_results = data["Products"]
+            elif isinstance(data, list):
+                search_results = data
+            if not search_results or len(search_results) == 0:
+                return []
+            results = []
+            for product in search_results:
+                try:
+                    r = self._product_to_result(product, part_number)
+                    if r.get("Manufacturer") != "검색 결과 없음":
+                        results.append(r)
+                except Exception:
+                    continue
+            return results
+        except RateLimitExceeded:
+            raise
+        except Exception as e:
+            print(f"유사 제품 검색 오류 ({part_number}): {str(e)}")
+            return []
     
     def get_product_details(self, part_number: str) -> Optional[Dict]:
         """
